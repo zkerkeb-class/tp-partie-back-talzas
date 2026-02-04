@@ -4,7 +4,7 @@ console.log("Attempting to connect to MongoDB...");
 
 export const connectDB = async () => {
     try {
-        await mongoose.connect("mongodb://localhost:27017/pokemon-db-2");
+        await mongoose.connect("mongodb://localhost:27017/pokemon");
         console.log("Connected to MongoDB successfully");
     } catch (error) {
         console.error("Error connecting to MongoDB:", error);
