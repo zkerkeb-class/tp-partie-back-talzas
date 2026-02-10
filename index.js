@@ -1,5 +1,4 @@
 import express from "express";
-import mongoose from "mongoose";
 import pokemon from "./schema/pokemon.js";
 import "./connect.js";
 
@@ -25,9 +24,7 @@ app.use("/assets", express.static("assets"));
 
 /* ===================== UPLOAD IMAGE ===================== */
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, "assets/uploads");
-  },
+  destination: (req, file, cb) => cb(null, "assets/uploads"),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname || ".png");
     const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
@@ -42,19 +39,39 @@ const upload = multer({
 
 app.post("/upload", upload.single("image"), (req, res) => {
   if (!req.file) return res.status(400).send("No file uploaded");
-
   const url = `http://localhost:3000/assets/uploads/${req.file.filename}`;
   res.json({ url });
 });
 
-/* ===================== ROUTES ===================== */
+/* ===================== HELPERS SEARCH ===================== */
+function escapeRegex(str = "") {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
+function detectMatchField(p, queryLower) {
+  const fields = [
+    ["english", p?.name?.english],
+    ["french", p?.name?.french],
+    ["japanese", p?.name?.japanese],
+    ["chinese", p?.name?.chinese],
+  ];
+
+  for (const [key, value] of fields) {
+    if (typeof value === "string" && value.toLowerCase().includes(queryLower)) {
+      return { matchedField: key, matchedValue: value };
+    }
+  }
+  return { matchedField: null, matchedValue: null };
+}
+
+/* ===================== ROUTES ===================== */
 app.get("/", (req, res) => {
   res.send("Pokemon API OK");
 });
 
 /**
  * GET paginé
+ * /pokemons?page=1&limit=20
  */
 app.get("/pokemons", async (req, res) => {
   try {
@@ -80,28 +97,111 @@ app.get("/pokemons", async (req, res) => {
 });
 
 /**
- * Recherche par nom
+ * 🔍 SEARCH multi-langues + partiel
+ * /pokemons/search?name=bulb
+ *
+ * Retourne:
+ * { pokemon: {...}, matchedField: "french", matchedValue: "Bulbizarre" }
  */
 app.get("/pokemons/search", async (req, res) => {
-  const name = req.query.name;
+  const name = (req.query.name || "").trim();
   if (!name) return res.status(400).send("Missing name");
 
-  const p = await pokemon.findOne({
-    "name.english": { $regex: name, $options: "i" },
-  });
+  try {
+    const safe = escapeRegex(name);
+    const regex = new RegExp(safe, "i");
 
-  if (!p) return res.status(404).send("Pokemon not found");
-  res.json(p);
+    const p = await pokemon.findOne({
+      $or: [
+        { "name.english": regex },
+        { "name.french": regex },
+        { "name.japanese": regex },
+        { "name.chinese": regex },
+      ],
+    });
+
+    if (!p) return res.status(404).send("Pokemon not found");
+
+    const { matchedField, matchedValue } = detectMatchField(p, name.toLowerCase());
+
+    res.json({
+      pokemon: p,
+      matchedField,   // english | french | japanese | chinese | null
+      matchedValue,   // la valeur exacte qui a matché
+    });
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
+/**
+ * ✨ AUTOCOMPLETE (suggestions)
+ * /pokemons/suggest?query=bul&limit=8
+ *
+ * Retourne une liste légère (id + noms + champ matché)
+ */
+app.get("/pokemons/suggest", async (req, res) => {
+  const query = (req.query.query || "").trim();
+  const limit = Math.min(Math.max(parseInt(req.query.limit || "8", 10), 1), 20);
+
+  if (!query) return res.json({ items: [] });
+
+  try {
+    const safe = escapeRegex(query);
+    const regex = new RegExp(safe, "i");
+
+    const list = await pokemon
+      .find(
+        {
+          $or: [
+            { "name.english": regex },
+            { "name.french": regex },
+            { "name.japanese": regex },
+            { "name.chinese": regex },
+          ],
+        },
+        {
+          id: 1,
+          name: 1,
+          image: 1,
+          type: 1,
+        }
+      )
+      .sort({ id: 1 })
+      .limit(limit);
+
+    const qLower = query.toLowerCase();
+
+    const items = list.map((p) => {
+      const { matchedField, matchedValue } = detectMatchField(p, qLower);
+      return {
+        id: p.id,
+        name: p.name,
+        image: p.image,
+        type: p.type,
+        matchedField,
+        matchedValue,
+      };
+    });
+
+    res.json({ items });
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
 });
 
 /**
  * GET by id
  */
 app.get("/pokemons/:id", async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const p = await pokemon.findOne({ id });
-  if (!p) return res.status(404).send("Pokemon not found");
-  res.json(p);
+  try {
+    const id = parseInt(req.params.id, 10);
+    const p = await pokemon.findOne({ id });
+    if (!p) return res.status(404).send("Pokemon not found");
+    res.json(p);
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
 });
 
 /**
@@ -112,6 +212,8 @@ app.post("/pokemons", async (req, res) => {
     const created = await pokemon.create(req.body);
     res.status(201).json(created);
   } catch (e) {
+    // duplicate id
+    if (e?.code === 11000) return res.status(409).send("Pokemon id already exists");
     res.status(400).send(e.message);
   }
 });
@@ -120,26 +222,34 @@ app.post("/pokemons", async (req, res) => {
  * UPDATE
  */
 app.put("/pokemons/:id", async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const updated = await pokemon.findOneAndUpdate(
-    { id },
-    req.body,
-    { new: true, runValidators: true }
-  );
+  try {
+    const id = parseInt(req.params.id, 10);
 
-  if (!updated) return res.status(404).send("Pokemon not found");
-  res.json(updated);
+    const updated = await pokemon.findOneAndUpdate(
+      { id },
+      req.body,
+      { new: true, runValidators: true }
+    );
+
+    if (!updated) return res.status(404).send("Pokemon not found");
+    res.json(updated);
+  } catch (e) {
+    res.status(400).send(e.message);
+  }
 });
 
 /**
  * DELETE
  */
 app.delete("/pokemons/:id", async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const deleted = await pokemon.findOneAndDelete({ id });
-
-  if (!deleted) return res.status(404).send("Pokemon not found");
-  res.json({ message: "Deleted" });
+  try {
+    const id = parseInt(req.params.id, 10);
+    const deleted = await pokemon.findOneAndDelete({ id });
+    if (!deleted) return res.status(404).send("Pokemon not found");
+    res.json({ message: "Deleted" });
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
 });
 
 /* ===================== SERVER ===================== */
